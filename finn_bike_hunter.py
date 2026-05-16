@@ -242,7 +242,7 @@ def visual_score(client, img_b64: str, refs: list[str]) -> tuple[float, str]:
     for attempt in range(2):
         try:
             response = client.models.generate_content(
-                model="gemini-1.5-flash",
+                model="gemini-1.5-flash-latest",
                 contents=contents,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
