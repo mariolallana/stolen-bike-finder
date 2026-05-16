@@ -23,18 +23,28 @@ GITHUB_REPO       = os.environ.get("GITHUB_REPOSITORY", "mariolallana/stolen-bik
 LOCATION_CODE  = "0.20061"   # Oslo municipality
 RADIUS_KM      = 60
 MAX_PRICE      = None         # Set to int NOK to cap price; None = no cap
-MAX_CANDIDATES = 10
-MAX_SCREENSHOTS = 4
-TEXT_GATE      = 4.0          # Min text score to proceed to visual check
+MAX_CANDIDATES = 15
+MAX_SCREENSHOTS = 5
+TEXT_GATE      = 3.5          # Lowered from 4.0 to catch listings without CX/kross keywords
 
 SEARCH_QUERIES = [
+    # Exact model
     "White+CX+Lite",
     "White+Bikes+CX",
     "White+CX",
+    # Gravel variants — sellers often skip the model name
+    "White+gravel",
+    "White+gruselsykkel",
+    "White+grus+sykkel",
+    "White+helårssykkel",       # "all-year bike" — matches how the example listing was described
+    "White+allround+sykkel",
+    # Full Norwegian cyclocross terms
     "White+cyclocross",
     "White+krossykkel",
     "White+kross+sykkel",
-    "krossykkel+svart+Sora",   # broad — capped at 3 new results
+    # Specs-only fallback — no brand, last resort
+    "krossykkel+svart+disc",
+    "gravel+sykkel+svart+disc",
 ]
 
 IMAGES_DIR = os.path.join(os.path.dirname(__file__), "images")
@@ -58,6 +68,8 @@ def text_score(title: str, desc: str) -> tuple[float, list[str]]:
 
     if any(kw in c for kw in ["cx", "cyclocross", "kross"]):
         score += 2.5; hits.append("CX/kross✓")
+    elif any(kw in c for kw in ["gravel", "grus", "allround", "allroad", "helårssykkel"]):
+        score += 1.5; hits.append("Gravel/grus✓")
 
     if "lite" in c:
         score += 1.5; hits.append("Lite✓")
@@ -83,8 +95,8 @@ def text_score(title: str, desc: str) -> tuple[float, list[str]]:
 
 def build_search_url(query: str) -> str:
     url = (
-        f"https://www.finn.no/bap/forsale/search.html"
-        f"?q={query}&location={LOCATION_CODE}&radius={RADIUS_KM}&vertical=bap"
+        f"https://www.finn.no/recommerce/forsale/search"
+        f"?q={query}&location={LOCATION_CODE}&radius={RADIUS_KM}"
     )
     if MAX_PRICE:
         url += f"&price_to={MAX_PRICE}"
@@ -219,7 +231,7 @@ def main():
         for i, query in enumerate(SEARCH_QUERIES):
             if len(candidates) >= MAX_CANDIDATES:
                 break
-            broad    = i >= 5
+            broad    = i >= 11   # last 2 queries are specs-only fallbacks
             max_new  = 3 if broad else MAX_CANDIDATES
             new_here = 0
             max_pages = 1 if broad else 2
