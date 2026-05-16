@@ -35,7 +35,7 @@ LOCATION_CODE    = "0.20061"   # Oslo municipality
 RADIUS_KM        = 60
 MAX_PRICE        = None        # Set to int NOK to cap price; None = no cap
 MAX_CANDIDATES   = 20
-MAX_SCREENSHOTS  = 8
+MAX_SCREENSHOTS  = 3           # Keep low to stay within Gemini free tier per-minute quota
 TEXT_GATE        = 3.5         # Only applies to brand queries (layer 1)
 
 SEARCH_QUERIES = [
@@ -435,6 +435,8 @@ def main():
                     continue
 
             shots += 1
+            if shots > 1:
+                time.sleep(4)  # respect Gemini free tier per-minute rate limit
             vis, note = visual_score(client, img_b64, refs_b64)
             c["visual_score"] = vis
             c["visual_note"]  = note
