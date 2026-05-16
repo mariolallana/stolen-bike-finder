@@ -248,18 +248,22 @@ def visual_score(client, screenshot_b64: str, refs: list[str]) -> tuple[float, s
 
 # ── GitHub Issue ──────────────────────────────────────────────────────────────
 
-def already_reported(item_id: str) -> bool:
+def get_reported_ids() -> set[str]:
+    """One API call — returns all item IDs already in issues (open or closed)."""
     if not GITHUB_TOKEN:
-        return False
+        return set()
     owner, repo = GITHUB_REPO.split("/")
     r = requests.get(
         f"https://api.github.com/repos/{owner}/{repo}/issues",
         headers={"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"},
-        params={"state": "open", "per_page": 50},
+        params={"state": "all", "per_page": 100},
     )
     if r.status_code != 200:
-        return False
-    return any(item_id in (i.get("body") or "") for i in r.json())
+        return set()
+    ids = set()
+    for issue in r.json():
+        ids.update(re.findall(r"/item/(\d+)", issue.get("body") or ""))
+    return ids
 
 def _stars(pct: int) -> str:
     if pct >= 72: return "★★★★★"
@@ -381,6 +385,7 @@ def main():
         print(f"\nFor visual check: {len(shortlist)} listings")
 
         # ── Visual verification ───────────────────────────────────────────
+        reported = get_reported_ids()
         matches, shots = [], 0
         # Brand query candidates first (higher text score = more likely match),
         # then spec-only candidates
@@ -389,8 +394,8 @@ def main():
         for c in shortlist:
             if shots >= MAX_SCREENSHOTS:
                 break
-            if already_reported(c["item_id"]):
-                print(f"  Already reported: {c['item_id']}"); continue
+            if c["item_id"] in reported:
+                print(f"  Skip (seen): {c['item_id']}"); continue
 
             screenshot_b64 = None
             img_url = c.get("img_url", "")
