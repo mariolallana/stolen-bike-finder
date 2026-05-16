@@ -201,12 +201,24 @@ def load_b64(path: str) -> str:
     with open(path, "rb") as f:
         return base64.standard_b64encode(f.read()).decode()
 
-def _img_part(b64: str):
-    return types.Part.from_bytes(data=base64.b64decode(b64), mime_type="image/jpeg")
+def _part(b64: str, mime: str = "image/jpeg") -> types.Part:
+    return types.Part(
+        inline_data=types.Blob(mime_type=mime, data=base64.b64decode(b64))
+    )
 
-def visual_score(client, screenshot_b64: str, refs: list[str]) -> tuple[float, str]:
+def fetch_image_b64(url: str) -> str | None:
+    """Download image bytes directly — cleaner than a browser screenshot."""
+    try:
+        r = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code == 200 and "image" in r.headers.get("content-type", ""):
+            return base64.b64encode(r.content).decode()
+    except Exception:
+        pass
+    return None
+
+def visual_score(client, img_b64: str, refs: list[str]) -> tuple[float, str]:
     prompt = (
-        "Compare this finn.no listing photo against the White CX Lite reference photos.\n\n"
+        "Compare this finn.no listing photo against the two White CX Lite reference photos.\n\n"
         "INSTANT REJECT (score 0) if: glossy frame, non-black base color (red, blue, white, silver, green, etc.), "
         "suspension fork, flat bars, or clearly a different bike type.\n\n"
         "Otherwise score these signals:\n"
@@ -216,34 +228,34 @@ def visual_score(client, screenshot_b64: str, refs: list[str]) -> tuple[float, s
         "+1.0 Matte black frame (flat, non-glossy finish)\n"
         "+0.5 Disc brakes visible at wheels\n"
         "+0.5 Drop bars + CX/gravel geometry\n\n"
-        "Respond ONLY with JSON (no markdown): "
-        "{\"visual_score\": <float>, \"confirmed\": [<signals>], \"rejected\": <bool>, \"note\": \"<one sentence>\"}\n\n"
-        "Reference photo 1 (full side view):"
+        'Respond ONLY with JSON: {"visual_score": <float>, "confirmed": [<signals>], "rejected": <bool>, "note": "<one sentence>"}'
     )
+    contents = types.Content(role="user", parts=[
+        types.Part(text=prompt),
+        types.Part(text="Reference photo 1 (full side view):"),
+        _part(refs[0]),
+        types.Part(text="Reference photo 2 (close-up top tube — most diagnostic):"),
+        _part(refs[1]),
+        types.Part(text="Listing photo to evaluate:"),
+        _part(img_b64),
+    ])
     for attempt in range(2):
         try:
             response = client.models.generate_content(
                 model="gemini-1.5-flash",
-                contents=[
-                    prompt,
-                    _img_part(refs[0]),
-                    "Reference photo 2 (close-up top tube — most diagnostic):",
-                    _img_part(refs[1]),
-                    "Listing photo to evaluate:",
-                    _img_part(screenshot_b64),
-                ],
+                contents=contents,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
-                    max_output_tokens=256,
+                    max_output_tokens=512,
                 ),
             )
             result = json.loads(response.text)
             return float(result.get("visual_score", 0)), result.get("note", "")
         except Exception as e:
-            if attempt == 0 and "429" in str(e):
-                time.sleep(30)   # back off on rate limit and retry once
-                continue
-            return 0.0, f"error: {str(e)[:120]}"
+            err = str(e)
+            if attempt == 0 and "429" in err:
+                print("  Rate limited — waiting 30s"); time.sleep(30); continue
+            return 0.0, f"error: {err[:150]}"
     return 0.0, "rate limit — skipped"
 
 # ── GitHub Issue ──────────────────────────────────────────────────────────────
@@ -397,27 +409,24 @@ def main():
             if c["item_id"] in reported:
                 print(f"  Skip (seen): {c['item_id']}"); continue
 
-            screenshot_b64 = None
+            img_b64 = None
             img_url = c.get("img_url", "")
 
+            # Prefer direct download — gives Gemini a clean image, no browser chrome
             if img_url:
-                try:
-                    page.goto(img_url, timeout=10000)
-                    screenshot_b64 = base64.standard_b64encode(page.screenshot()).decode()
-                    shots += 1
-                except Exception:
-                    pass
+                img_b64 = fetch_image_b64(img_url)
 
-            if not screenshot_b64:
+            # Playwright fallback — screenshot the listing page
+            if not img_b64:
                 try:
                     page.goto(c["url"], timeout=15000)
                     page.wait_for_timeout(2000)
-                    screenshot_b64 = base64.standard_b64encode(page.screenshot()).decode()
-                    shots += 1
+                    img_b64 = base64.b64encode(page.screenshot()).decode()
                 except Exception:
                     continue
 
-            vis, note = visual_score(client, screenshot_b64, refs_b64)
+            shots += 1
+            vis, note = visual_score(client, img_b64, refs_b64)
             c["visual_score"] = vis
             c["visual_note"]  = note
             c["final_score"]  = c["text_score"] + vis
