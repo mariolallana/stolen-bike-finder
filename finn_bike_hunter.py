@@ -15,13 +15,13 @@ import base64
 import json
 import time
 
-import anthropic
+import google.generativeai as genai
 import requests
 from playwright.sync_api import sync_playwright
 
 # ── Config ───────────────────────────────────────────────────────────────────
 
-ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 GITHUB_TOKEN      = os.environ.get("GITHUB_TOKEN", "")
 GITHUB_REPO       = os.environ.get("GITHUB_REPOSITORY", "mariolallana/stolen-bike-finder")
 
@@ -194,44 +194,41 @@ def parse_jsonld(html: str, url: str) -> dict:
 
     return {"url": url, "title": title, "price": price, "description": desc, "img_url": img}
 
-# ── Visual scoring via Anthropic API ─────────────────────────────────────────
+# ── Visual scoring via Gemini (free tier) ────────────────────────────────────
 
 def load_b64(path: str) -> str:
     with open(path, "rb") as f:
         return base64.standard_b64encode(f.read()).decode()
 
-def visual_score(client: anthropic.Anthropic, screenshot_b64: str, refs: list[str]) -> tuple[float, str]:
-    msg = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=300,
-        messages=[{"role": "user", "content": [
-            {"type": "text", "text": (
-                "Compare this finn.no listing photo against the White CX Lite reference photos.\n\n"
-                "INSTANT REJECT (score 0) if: glossy frame, non-black base color (red, blue, white, silver, etc.), "
-                "suspension fork, flat bars, or clearly a different bike type.\n\n"
-                "Otherwise score these signals:\n"
-                "+2.5 Reflective silver-white geometric shard/triangle pattern on top tube\n"
-                "+2.0 Neon lime-yellow 'WHITE' wordmark visible on frame\n"
-                "+1.5 'CX LITE' text on frame\n"
-                "+1.0 Matte black frame (flat, non-glossy finish)\n"
-                "+0.5 Disc brakes visible at wheels\n"
-                "+0.5 Drop bars + CX/gravel geometry\n\n"
-                "Respond ONLY with JSON: "
-                "{\"visual_score\": <float>, \"confirmed\": [<signals list>], \"rejected\": <bool>, \"note\": \"<one sentence>\"}\n\n"
-                "Reference photo 1 (full side view):"
-            )},
-            {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": refs[0]}},
-            {"type": "text", "text": "Reference photo 2 (close-up top tube — most diagnostic):"},
-            {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": refs[1]}},
-            {"type": "text", "text": "Listing photo to evaluate:"},
-            {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": screenshot_b64}},
-        ]}],
+def _img(b64: str) -> dict:
+    return {"mime_type": "image/jpeg", "data": base64.b64decode(b64)}
+
+def visual_score(model, screenshot_b64: str, refs: list[str]) -> tuple[float, str]:
+    prompt = (
+        "Compare this finn.no listing photo against the White CX Lite reference photos.\n\n"
+        "INSTANT REJECT (score 0) if: glossy frame, non-black base color (red, blue, white, silver, green, etc.), "
+        "suspension fork, flat bars, or clearly a different bike type.\n\n"
+        "Otherwise score these signals:\n"
+        "+2.5 Reflective silver-white geometric shard/triangle pattern on top tube\n"
+        "+2.0 Neon lime-yellow 'WHITE' wordmark visible on frame\n"
+        "+1.5 'CX LITE' text on frame\n"
+        "+1.0 Matte black frame (flat, non-glossy finish)\n"
+        "+0.5 Disc brakes visible at wheels\n"
+        "+0.5 Drop bars + CX/gravel geometry\n\n"
+        "Respond ONLY with JSON (no markdown): "
+        "{\"visual_score\": <float>, \"confirmed\": [<signals>], \"rejected\": <bool>, \"note\": \"<one sentence>\"}\n\n"
+        "Reference photo 1 (full side view):"
     )
     try:
-        result = json.loads(msg.content[0].text)
+        response = model.generate_content(
+            [prompt, _img(refs[0]), "Reference photo 2 (close-up top tube — most diagnostic):", _img(refs[1]),
+             "Listing photo to evaluate:", _img(screenshot_b64)],
+            generation_config={"response_mime_type": "application/json", "max_output_tokens": 256},
+        )
+        result = json.loads(response.text)
         return float(result.get("visual_score", 0)), result.get("note", "")
-    except Exception:
-        return 0.0, "parse error"
+    except Exception as e:
+        return 0.0, f"parse error: {e}"
 
 # ── GitHub Issue ──────────────────────────────────────────────────────────────
 
@@ -281,7 +278,8 @@ def create_issue(matches: list[dict]) -> None:
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    client   = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    genai.configure(api_key=GEMINI_API_KEY)
+    model    = genai.GenerativeModel("gemini-2.0-flash")
     refs_b64 = [load_b64(p) for p in REFERENCE_IMAGES]
 
     candidates: dict[str, dict] = {}  # item_id → candidate dict
@@ -384,7 +382,7 @@ def main():
                 except Exception:
                     continue
 
-            vis, note = visual_score(client, screenshot_b64, refs_b64)
+            vis, note = visual_score(model, screenshot_b64, refs_b64)
             c["visual_score"] = vis
             c["visual_note"]  = note
             c["final_score"]  = c["text_score"] + vis
