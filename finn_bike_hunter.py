@@ -4,8 +4,8 @@ FINN Bike Hunter — White CX Lite Oslo
 Searches finn.no every 4 hours and creates a GitHub Issue when a match is found.
 
 Two-layer strategy:
-  Layer 1 (queries 0-10): Brand queries — all include "White". Text gate applies.
-  Layer 2 (queries 11-12): Spec-only queries — no brand. Text gate bypassed,
+  Layer 1 (queries 0-10):  Brand queries — all include "White". Text gate applies.
+  Layer 2 (queries 11-17): Spec-only queries — no brand. Text gate bypassed,
                             visual check always runs. The query itself is the filter.
 """
 
@@ -28,10 +28,9 @@ GITHUB_REPO       = os.environ.get("GITHUB_REPOSITORY", "mariolallana/stolen-bik
 LOCATION_CODE    = "0.20061"   # Oslo municipality
 RADIUS_KM        = 60
 MAX_PRICE        = None        # Set to int NOK to cap price; None = no cap
-MAX_CANDIDATES   = 15
-MAX_SCREENSHOTS  = 6
+MAX_CANDIDATES   = 20
+MAX_SCREENSHOTS  = 8
 TEXT_GATE        = 3.5         # Only applies to brand queries (layer 1)
-SPEC_QUERY_START = 11          # Index where spec-only (no brand) queries begin
 
 SEARCH_QUERIES = [
     # Layer 1 — brand queries (text gate applies)
@@ -49,7 +48,14 @@ SEARCH_QUERIES = [
     # Layer 2 — spec-only queries (text gate bypassed, always screenshotted)
     "krossykkel+svart+disc",    # 11 — black CX + disc, no brand
     "gravel+sykkel+svart+disc", # 12 — black gravel + disc, no brand
+    "krossykkel+sora",          # 13 — Sora groupset is very specific to this price point
+    "gravel+sykkel+sora",       # 14 — gravel + Sora
+    "krossykkel+sort+disc",     # 15 — "sort" = the other Norwegian word for black
+    "cx+sykkel+svart",          # 16 — CX abbreviation + black
+    "krossykkel+skivebremser",  # 17 — full Norwegian for disc brakes
 ]
+
+SPEC_QUERY_START = 11  # queries from this index onward bypass the text gate
 
 IMAGES_DIR = os.path.join(os.path.dirname(__file__), "images")
 REFERENCE_IMAGES = [
@@ -161,16 +167,19 @@ def fetch_listing_data(url: str, page) -> dict:
 
 def parse_jsonld(html: str, url: str) -> dict:
     """Extract listing fields from JSON-LD schema (embedded in page, no JS required)."""
-    m = re.search(r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', html, re.S)
-    if not m:
-        return {"url": url, "title": "?", "price": "N/A", "description": "", "img_url": ""}
+    # Find ALL JSON-LD scripts and pick the Product one (page may have multiple schemas)
+    blocks = re.findall(r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', html, re.S)
+    data = None
+    for block in blocks:
+        try:
+            candidate = json.loads(block)
+            if candidate.get("@type") == "Product":
+                data = candidate
+                break
+        except Exception:
+            continue
 
-    try:
-        data = json.loads(m.group(1))
-    except Exception:
-        return {"url": url, "title": "?", "price": "N/A", "description": "", "img_url": ""}
-
-    if data.get("@type") != "Product":
+    if not data:
         return {"url": url, "title": "?", "price": "N/A", "description": "", "img_url": ""}
 
     title  = data.get("name", "?")
@@ -295,7 +304,8 @@ def main():
                 except Exception as e:
                     print(f"Query {i+1} page {pg}: {e}"); break
 
-                for link in extract_links_from_html(html):
+                links = extract_links_from_html(html)
+                for link in links:
                     full_url = "https://www.finn.no" + link
                     item_id  = extract_item_id(full_url)
                     if item_id and item_id not in candidates:
@@ -308,7 +318,7 @@ def main():
                         if new_here >= max_new or len(candidates) >= MAX_CANDIDATES:
                             break
 
-                if not extract_links_from_html(html):
+                if not links:
                     break
 
             print(f"Query {i+1} ({'spec' if is_spec_query else 'brand'}) [{query[:22]}]: pool={len(candidates)}")
