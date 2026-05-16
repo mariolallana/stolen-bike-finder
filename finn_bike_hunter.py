@@ -9,11 +9,14 @@ Two-layer strategy:
                             visual check always runs. The query itself is the filter.
 """
 
+import io
 import os
 import re
 import base64
 import json
 import time
+
+from PIL import Image
 
 from google import genai
 from google.genai import types
@@ -35,7 +38,7 @@ LOCATION_CODE    = "0.20061"   # Oslo municipality
 RADIUS_KM        = 60
 MAX_PRICE        = None        # Set to int NOK to cap price; None = no cap
 MAX_CANDIDATES   = 20
-MAX_SCREENSHOTS  = 3           # Keep low to stay within Gemini free tier per-minute quota
+MAX_SCREENSHOTS  = 6           # Resized images are tiny — free tier handles this easily
 TEXT_GATE        = 3.5         # Only applies to brand queries (layer 1)
 
 SEARCH_QUERIES = [
@@ -202,9 +205,18 @@ def parse_jsonld(html: str, url: str) -> dict:
 
 # ── Visual scoring via Gemini 1.5 Flash (free tier) ──────────────────────────
 
+def _shrink(image_bytes: bytes, max_px: int = 400) -> bytes:
+    """Resize to max_px wide, JPEG quality 65. Cuts token usage ~90%."""
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    if img.width > max_px:
+        img = img.resize((max_px, int(img.height * max_px / img.width)), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=65)
+    return buf.getvalue()
+
 def load_b64(path: str) -> str:
     with open(path, "rb") as f:
-        return base64.standard_b64encode(f.read()).decode()
+        return base64.standard_b64encode(_shrink(f.read())).decode()
 
 def _part(b64: str, mime: str = "image/jpeg") -> types.Part:
     return types.Part(
@@ -212,11 +224,11 @@ def _part(b64: str, mime: str = "image/jpeg") -> types.Part:
     )
 
 def fetch_image_b64(url: str) -> str | None:
-    """Download image bytes directly — cleaner than a browser screenshot."""
+    """Download + shrink image — clean input for Gemini, no browser chrome."""
     try:
         r = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
         if r.status_code == 200 and "image" in r.headers.get("content-type", ""):
-            return base64.b64encode(r.content).decode()
+            return base64.b64encode(_shrink(r.content)).decode()
     except Exception:
         pass
     return None
@@ -430,13 +442,11 @@ def main():
                 try:
                     page.goto(c["url"], timeout=15000)
                     page.wait_for_timeout(2000)
-                    img_b64 = base64.b64encode(page.screenshot()).decode()
+                    img_b64 = base64.b64encode(_shrink(page.screenshot())).decode()
                 except Exception:
                     continue
 
             shots += 1
-            if shots > 1:
-                time.sleep(4)  # respect Gemini free tier per-minute rate limit
             vis, note = visual_score(client, img_b64, refs_b64)
             c["visual_score"] = vis
             c["visual_note"]  = note
