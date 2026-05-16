@@ -134,11 +134,16 @@ def extract_item_id(url: str) -> str | None:
     return m.group(1) if m else None
 
 def extract_links_from_html(html: str) -> list[str]:
-    # Match new finn.no item URLs
-    items = re.findall(r'href="(/recommerce/forsale/item/\d+)"', html)
-    # Also catch legacy URLs just in case
-    legacy = re.findall(r'href="(/bap/forsale/ad\.html\?finnkode=\d+)"', html)
-    return list(dict.fromkeys(items + legacy))
+    # finn.no renders full absolute URLs — match both formats
+    full = re.findall(r'https://www\.finn\.no/recommerce/forsale/item/(\d+)', html)
+    rel  = re.findall(r'href="(/recommerce/forsale/item/\d+)"', html)
+    rel_full = [f"https://www.finn.no{r}" for r in rel]
+    # Build deduplicated list of full URLs
+    all_urls = [f"https://www.finn.no/recommerce/forsale/item/{i}" for i in dict.fromkeys(full)]
+    for u in rel_full:
+        if u not in all_urls:
+            all_urls.append(u)
+    return all_urls
 
 def fetch_listing_data(url: str, page) -> dict:
     """
@@ -305,9 +310,8 @@ def main():
                     print(f"Query {i+1} page {pg}: {e}"); break
 
                 links = extract_links_from_html(html)
-                for link in links:
-                    full_url = "https://www.finn.no" + link
-                    item_id  = extract_item_id(full_url)
+                for full_url in links:
+                    item_id = extract_item_id(full_url)
                     if item_id and item_id not in candidates:
                         candidates[item_id] = {
                             "url":         full_url,
