@@ -2,6 +2,11 @@
 """
 FINN Bike Hunter — White CX Lite Oslo
 Searches finn.no every 4 hours and creates a GitHub Issue when a match is found.
+
+Two-layer strategy:
+  Layer 1 (queries 0-10): Brand queries — all include "White". Text gate applies.
+  Layer 2 (queries 11-12): Spec-only queries — no brand. Text gate bypassed,
+                            visual check always runs. The query itself is the filter.
 """
 
 import os
@@ -20,31 +25,30 @@ ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 GITHUB_TOKEN      = os.environ.get("GITHUB_TOKEN", "")
 GITHUB_REPO       = os.environ.get("GITHUB_REPOSITORY", "mariolallana/stolen-bike-finder")
 
-LOCATION_CODE  = "0.20061"   # Oslo municipality
-RADIUS_KM      = 60
-MAX_PRICE      = None         # Set to int NOK to cap price; None = no cap
-MAX_CANDIDATES = 15
-MAX_SCREENSHOTS = 5
-TEXT_GATE      = 3.5          # Lowered from 4.0 to catch listings without CX/kross keywords
+LOCATION_CODE    = "0.20061"   # Oslo municipality
+RADIUS_KM        = 60
+MAX_PRICE        = None        # Set to int NOK to cap price; None = no cap
+MAX_CANDIDATES   = 15
+MAX_SCREENSHOTS  = 6
+TEXT_GATE        = 3.5         # Only applies to brand queries (layer 1)
+SPEC_QUERY_START = 11          # Index where spec-only (no brand) queries begin
 
 SEARCH_QUERIES = [
-    # Exact model
-    "White+CX+Lite",
-    "White+Bikes+CX",
-    "White+CX",
-    # Gravel variants — sellers often skip the model name
-    "White+gravel",
-    "White+gruselsykkel",
-    "White+grus+sykkel",
-    "White+helårssykkel",       # "all-year bike" — matches how the example listing was described
-    "White+allround+sykkel",
-    # Full Norwegian cyclocross terms
-    "White+cyclocross",
-    "White+krossykkel",
-    "White+kross+sykkel",
-    # Specs-only fallback — no brand, last resort
-    "krossykkel+svart+disc",
-    "gravel+sykkel+svart+disc",
+    # Layer 1 — brand queries (text gate applies)
+    "White+CX+Lite",            # 0 — exact model
+    "White+Bikes+CX",           # 1 — full brand name
+    "White+CX",                 # 2 — brand + type
+    "White+gravel",             # 3 — sellers often just write "White gravel"
+    "White+gruselsykkel",       # 4 — Norwegian: gravel bike
+    "White+grus+sykkel",        # 5 — Norwegian gravel, space variant
+    "White+helårssykkel",       # 6 — "all-year bike" — common vague description
+    "White+allround+sykkel",    # 7 — all-rounder framing
+    "White+cyclocross",         # 8 — English full term
+    "White+krossykkel",         # 9 — Norwegian cyclocross
+    "White+kross+sykkel",       # 10 — Norwegian cyclocross, space variant
+    # Layer 2 — spec-only queries (text gate bypassed, always screenshotted)
+    "krossykkel+svart+disc",    # 11 — black CX + disc, no brand
+    "gravel+sykkel+svart+disc", # 12 — black gravel + disc, no brand
 ]
 
 IMAGES_DIR = os.path.join(os.path.dirname(__file__), "images")
@@ -53,7 +57,7 @@ REFERENCE_IMAGES = [
     os.path.join(IMAGES_DIR, "bike_image_2.jpeg"),
 ]
 
-# ── Text scoring ─────────────────────────────────────────────────────────────
+# ── Text scoring ──────────────────────────────────────────────────────────────
 
 def text_score(title: str, desc: str) -> tuple[float, list[str]]:
     t = title.lower()
@@ -61,31 +65,43 @@ def text_score(title: str, desc: str) -> tuple[float, list[str]]:
     c = t + " " + d
     score, hits = 0.0, []
 
+    # Brand
     if "white" in t:
         score += 3.0; hits.append("White✓(title)")
     elif "white" in d:
         score += 1.5; hits.append("White✓(desc)")
 
-    if any(kw in c for kw in ["cx", "cyclocross", "kross"]):
+    # Bike type — specific CX/kross terms score higher than generic gravel
+    if any(kw in c for kw in ["cx", "cyclocross", "kross", "cx-sykkel", "crosssykkel"]):
         score += 2.5; hits.append("CX/kross✓")
     elif any(kw in c for kw in ["gravel", "grus", "allround", "allroad", "helårssykkel"]):
         score += 1.5; hits.append("Gravel/grus✓")
 
+    # Model variant
     if "lite" in c:
         score += 1.5; hits.append("Lite✓")
 
+    # Size
     if any(kw in c for kw in ["52", "s/m", "small medium", "small/medium"]):
         score += 1.0; hits.append("52cm✓")
 
-    if any(kw in c for kw in ["sora", "9-speed", "9s", "2x9"]):
+    # Groupset
+    if any(kw in c for kw in ["sora", "9-speed", "9s", "2x9", "9-gir", "shimano sora"]):
         score += 0.5; hits.append("Sora✓")
 
-    if any(kw in c for kw in ["disc", "skive", "promax", "tektro"]):
+    # Brakes
+    if any(kw in c for kw in ["disc", "skive", "promax", "tektro", "mekanisk", "skivebremser"]):
         score += 0.5; hits.append("Disc✓")
 
+    # Wheel size
     if any(kw in c for kw in ["700c", '28"', "28 tommer"]):
         score += 0.3; hits.append("700c✓")
 
+    # Frame material
+    if any(kw in c for kw in ["aluminium", " alu ", "6061"]):
+        score += 0.2; hits.append("Alu✓")
+
+    # Color
     if any(kw in c for kw in ["svart", "sort", "black", "matt"]):
         score += 0.2; hits.append("Svart✓")
 
@@ -102,36 +118,67 @@ def build_search_url(query: str) -> str:
         url += f"&price_to={MAX_PRICE}"
     return url
 
-def extract_finnkode(url: str) -> str | None:
-    m = re.search(r"finnkode[=_](\d+)", url)
+def extract_item_id(url: str) -> str | None:
+    # New finn.no URL format: /recommerce/forsale/item/XXXXXXXXX
+    m = re.search(r"/item/(\d+)", url)
     if m:
         return m.group(1)
-    m = re.search(r"/article/(\d+)", url)
+    # Legacy format fallback
+    m = re.search(r"finnkode[=_](\d+)", url)
     return m.group(1) if m else None
 
-def fetch_listing_html(url: str) -> str:
+def extract_links_from_html(html: str) -> list[str]:
+    # Match new finn.no item URLs
+    items = re.findall(r'href="(/recommerce/forsale/item/\d+)"', html)
+    # Also catch legacy URLs just in case
+    legacy = re.findall(r'href="(/bap/forsale/ad\.html\?finnkode=\d+)"', html)
+    return list(dict.fromkeys(items + legacy))
+
+def fetch_listing_data(url: str, page) -> dict:
+    """
+    Extract listing data from JSON-LD (most reliable) with Playwright fallback.
+    Returns dict with title, price, description, img_url.
+    """
+    # Try requests first (fast, no JS needed for JSON-LD which is in raw HTML)
+    html = ""
     try:
         r = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
         if len(r.text) > 400:
-            return r.text
+            html = r.text
     except Exception:
         pass
-    return ""
 
-def parse_listing(html: str, url: str) -> dict:
-    title_m = re.search(r"<title[^>]*>([^<]+)</title>", html, re.I)
-    title   = title_m.group(1).strip() if title_m else "?"
+    # Playwright fallback
+    if not html:
+        try:
+            page.goto(url, timeout=15000)
+            page.wait_for_timeout(1500)
+            html = page.content()
+        except Exception:
+            return {}
 
-    price_m = re.search(r"([\d\s]{3,})\s*kr", html)
-    price   = price_m.group(1).replace(" ", "").strip() if price_m else "N/A"
+    return parse_jsonld(html, url)
 
-    text = re.sub(r"<[^>]+>", " ", html)
-    text = re.sub(r"\s+", " ", text).strip()[:600]
+def parse_jsonld(html: str, url: str) -> dict:
+    """Extract listing fields from JSON-LD schema (embedded in page, no JS required)."""
+    m = re.search(r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', html, re.S)
+    if not m:
+        return {"url": url, "title": "?", "price": "N/A", "description": "", "img_url": ""}
 
-    img_urls = re.findall(r'https://[^\s"\'<>]+?\.jpe?g', html, re.I)
-    img_urls = list(dict.fromkeys(img_urls))[:2]
+    try:
+        data = json.loads(m.group(1))
+    except Exception:
+        return {"url": url, "title": "?", "price": "N/A", "description": "", "img_url": ""}
 
-    return {"url": url, "title": title, "price": price, "description": text, "img_urls": img_urls}
+    if data.get("@type") != "Product":
+        return {"url": url, "title": "?", "price": "N/A", "description": "", "img_url": ""}
+
+    title  = data.get("name", "?")
+    desc   = data.get("description", "")[:600]
+    img    = data.get("image", "")
+    price  = str(data.get("offers", {}).get("price", "N/A"))
+
+    return {"url": url, "title": title, "price": price, "description": desc, "img_url": img}
 
 # ── Visual scoring via Anthropic API ─────────────────────────────────────────
 
@@ -142,21 +189,21 @@ def load_b64(path: str) -> str:
 def visual_score(client: anthropic.Anthropic, screenshot_b64: str, refs: list[str]) -> tuple[float, str]:
     msg = client.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=256,
+        max_tokens=300,
         messages=[{"role": "user", "content": [
             {"type": "text", "text": (
                 "Compare this finn.no listing photo against the White CX Lite reference photos.\n\n"
-                "INSTANT REJECT (return score 0) if: glossy frame, non-black base color, "
-                "suspension fork, flat bars, or clearly a different style of bike.\n\n"
+                "INSTANT REJECT (score 0) if: glossy frame, non-black base color (red, blue, white, silver, etc.), "
+                "suspension fork, flat bars, or clearly a different bike type.\n\n"
                 "Otherwise score these signals:\n"
-                "+2.5 Reflective silver-white geometric shard pattern on top tube (mirror-like triangles)\n"
-                "+2.0 Neon lime-yellow 'WHITE' wordmark on down tube\n"
-                "+1.5 'CX LITE' text visible on frame\n"
+                "+2.5 Reflective silver-white geometric shard/triangle pattern on top tube\n"
+                "+2.0 Neon lime-yellow 'WHITE' wordmark visible on frame\n"
+                "+1.5 'CX LITE' text on frame\n"
                 "+1.0 Matte black frame (flat, non-glossy finish)\n"
-                "+0.5 Mechanical disc brakes visible\n"
+                "+0.5 Disc brakes visible at wheels\n"
                 "+0.5 Drop bars + CX/gravel geometry\n\n"
                 "Respond ONLY with JSON: "
-                "{\"visual_score\": <float>, \"confirmed\": [<signals>], \"rejected\": <bool>, \"note\": \"<one sentence>\"}\n\n"
+                "{\"visual_score\": <float>, \"confirmed\": [<signals list>], \"rejected\": <bool>, \"note\": \"<one sentence>\"}\n\n"
                 "Reference photo 1 (full side view):"
             )},
             {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": refs[0]}},
@@ -174,7 +221,7 @@ def visual_score(client: anthropic.Anthropic, screenshot_b64: str, refs: list[st
 
 # ── GitHub Issue ──────────────────────────────────────────────────────────────
 
-def already_reported(finnkode: str) -> bool:
+def already_reported(item_id: str) -> bool:
     if not GITHUB_TOKEN:
         return False
     owner, repo = GITHUB_REPO.split("/")
@@ -185,22 +232,24 @@ def already_reported(finnkode: str) -> bool:
     )
     if r.status_code != 200:
         return False
-    return any(finnkode in (i.get("body") or "") for i in r.json())
+    return any(item_id in (i.get("body") or "") for i in r.json())
 
 def create_issue(matches: list[dict]) -> None:
     if not GITHUB_TOKEN:
         print("No GITHUB_TOKEN — skipping issue creation")
         return
 
-    lines = [f"## {len(matches)} White CX Lite match(es) found on finn.no\n"]
+    lines = [f"## {len(matches)} potential White CX Lite match(es) on finn.no\n"]
     for m in matches:
+        layer = "Brand query" if m.get("brand_query") else "**Spec-only query** (no brand in listing)"
         lines += [
             f"### {m['title']}",
             f"**Score:** {m['final_score']:.1f} / 18.0  (text {m['text_score']:.1f} + visual {m['visual_score']:.1f})",
             f"**Price:** {m['price']} NOK",
-            f"**Matched:** {' · '.join(m['hits'])}",
+            f"**Found via:** {layer}",
+            f"**Text hits:** {' · '.join(m['hits']) if m['hits'] else 'none (spec-only)'}",
             f"**Visual:** {m['visual_note']}",
-            f"**Finnkode:** {m['finnkode']}",
+            f"**Item ID:** {m['item_id']}",
             f"**Link:** {m['url']}\n",
         ]
 
@@ -218,23 +267,24 @@ def create_issue(matches: list[dict]) -> None:
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    client  = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    client   = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     refs_b64 = [load_b64(p) for p in REFERENCE_IMAGES]
 
-    candidates: dict[str, dict] = {}
+    candidates: dict[str, dict] = {}  # item_id → candidate dict
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
         page    = browser.new_page(user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36")
 
-        # ── S1–S2: Collect listing URLs via Playwright ────────────────────
+        # ── Collect listing URLs ──────────────────────────────────────────
         for i, query in enumerate(SEARCH_QUERIES):
             if len(candidates) >= MAX_CANDIDATES:
                 break
-            broad    = i >= 11   # last 2 queries are specs-only fallbacks
-            max_new  = 3 if broad else MAX_CANDIDATES
+
+            is_spec_query = i >= SPEC_QUERY_START
+            max_new  = 3 if is_spec_query else MAX_CANDIDATES
+            max_pages = 1 if is_spec_query else 2
             new_here = 0
-            max_pages = 1 if broad else 2
 
             for pg in range(1, max_pages + 1):
                 url = build_search_url(query) + (f"&page={pg}" if pg > 1 else "")
@@ -245,71 +295,75 @@ def main():
                 except Exception as e:
                     print(f"Query {i+1} page {pg}: {e}"); break
 
-                links = re.findall(
-                    r'href="(/bap/forsale/ad\.html\?finnkode=\d+|/article/\d+)"', html
-                )
-                for link in links:
-                    full = "https://www.finn.no" + link
-                    kode = extract_finnkode(full)
-                    if kode and kode not in candidates:
-                        candidates[kode] = {"url": full, "finnkode": kode}
+                for link in extract_links_from_html(html):
+                    full_url = "https://www.finn.no" + link
+                    item_id  = extract_item_id(full_url)
+                    if item_id and item_id not in candidates:
+                        candidates[item_id] = {
+                            "url":         full_url,
+                            "item_id":     item_id,
+                            "brand_query": not is_spec_query,
+                        }
                         new_here += 1
                         if new_here >= max_new or len(candidates) >= MAX_CANDIDATES:
                             break
 
-                if not links:
+                if not extract_links_from_html(html):
                     break
 
-            print(f"Query {i+1} ({query[:20]}): pool now {len(candidates)}")
+            print(f"Query {i+1} ({'spec' if is_spec_query else 'brand'}) [{query[:22]}]: pool={len(candidates)}")
             time.sleep(1)
 
         print(f"\nTotal candidates: {len(candidates)}")
 
-        # ── S3–S4: Enrich + text score ────────────────────────────────────
+        # ── Enrich + text score ───────────────────────────────────────────
         shortlist = []
-        for kode, c in candidates.items():
-            html = fetch_listing_html(c["url"])
-            if len(html) < 400:
-                try:
-                    page.goto(c["url"], timeout=15000)
-                    page.wait_for_timeout(1500)
-                    html = page.content()
-                except Exception:
-                    continue
+        for item_id, c in candidates.items():
+            data = fetch_listing_data(c["url"], page)
+            if not data or not data.get("title"):
+                continue
 
-            listing             = parse_listing(html, c["url"])
-            listing["finnkode"] = kode
-            sc, hits            = text_score(listing["title"], listing["description"])
-            listing["text_score"] = sc
-            listing["hits"]       = hits
+            c.update(data)
+            sc, hits = text_score(c.get("title", ""), c.get("description", ""))
+            c["text_score"] = sc
+            c["hits"]       = hits
 
-            print(f"  [{sc:.1f}] {listing['title'][:60]}")
-            if sc >= TEXT_GATE:
-                shortlist.append(listing)
+            # Spec-only candidates bypass the text gate — they go to visual regardless
+            passes = (not c["brand_query"]) or (sc >= TEXT_GATE)
+            label  = f"[{sc:.1f}{'*bypass' if not c['brand_query'] else ''}]"
+            print(f"  {label} {c.get('title','?')[:60]}")
 
-        print(f"\nPassed text gate (≥{TEXT_GATE}): {len(shortlist)}")
+            if passes:
+                shortlist.append(c)
 
-        # ── S5: Visual verification ───────────────────────────────────────
+        print(f"\nFor visual check: {len(shortlist)} listings")
+
+        # ── Visual verification ───────────────────────────────────────────
         matches, shots = [], 0
+        # Brand query candidates first (higher text score = more likely match),
+        # then spec-only candidates
+        shortlist.sort(key=lambda x: (not x["brand_query"], -x["text_score"]))
 
-        for listing in sorted(shortlist, key=lambda x: x["text_score"], reverse=True):
+        for c in shortlist:
             if shots >= MAX_SCREENSHOTS:
                 break
-            if already_reported(listing["finnkode"]):
-                print(f"  Already reported: {listing['finnkode']}"); continue
+            if already_reported(c["item_id"]):
+                print(f"  Already reported: {c['item_id']}"); continue
 
             screenshot_b64 = None
-            for img_url in listing.get("img_urls", []):
+            img_url = c.get("img_url", "")
+
+            if img_url:
                 try:
                     page.goto(img_url, timeout=10000)
                     screenshot_b64 = base64.standard_b64encode(page.screenshot()).decode()
-                    shots += 1; break
+                    shots += 1
                 except Exception:
                     pass
 
             if not screenshot_b64:
                 try:
-                    page.goto(listing["url"], timeout=15000)
+                    page.goto(c["url"], timeout=15000)
                     page.wait_for_timeout(2000)
                     screenshot_b64 = base64.standard_b64encode(page.screenshot()).decode()
                     shots += 1
@@ -317,13 +371,13 @@ def main():
                     continue
 
             vis, note = visual_score(client, screenshot_b64, refs_b64)
-            listing["visual_score"] = vis
-            listing["visual_note"]  = note
-            listing["final_score"]  = listing["text_score"] + vis
+            c["visual_score"] = vis
+            c["visual_note"]  = note
+            c["final_score"]  = c["text_score"] + vis
             print(f"  Visual +{vis:.1f}: {note}")
 
-            if listing["final_score"] >= 5.0:
-                matches.append(listing)
+            if c["final_score"] >= 5.0:
+                matches.append(c)
 
         browser.close()
 
@@ -331,7 +385,7 @@ def main():
     print(f"\n{'='*50}")
     print(f"MATCHES FOUND: {len(matches)}")
     for m in matches:
-        print(f"  [{m['final_score']:.1f}/18.0] {m['title']}")
+        print(f"  [{m['final_score']:.1f}/18.0] {m.get('title','?')}")
         print(f"  {m['url']}")
 
     if matches:
