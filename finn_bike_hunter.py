@@ -15,7 +15,8 @@ import base64
 import json
 import time
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 import requests
 from playwright.sync_api import sync_playwright
 
@@ -194,16 +195,16 @@ def parse_jsonld(html: str, url: str) -> dict:
 
     return {"url": url, "title": title, "price": price, "description": desc, "img_url": img}
 
-# ── Visual scoring via Gemini (free tier) ────────────────────────────────────
+# ── Visual scoring via Gemini 1.5 Flash (free tier) ──────────────────────────
 
 def load_b64(path: str) -> str:
     with open(path, "rb") as f:
         return base64.standard_b64encode(f.read()).decode()
 
-def _img(b64: str) -> dict:
-    return {"mime_type": "image/jpeg", "data": base64.b64decode(b64)}
+def _img_part(b64: str):
+    return types.Part.from_bytes(data=base64.b64decode(b64), mime_type="image/jpeg")
 
-def visual_score(model, screenshot_b64: str, refs: list[str]) -> tuple[float, str]:
+def visual_score(client, screenshot_b64: str, refs: list[str]) -> tuple[float, str]:
     prompt = (
         "Compare this finn.no listing photo against the White CX Lite reference photos.\n\n"
         "INSTANT REJECT (score 0) if: glossy frame, non-black base color (red, blue, white, silver, green, etc.), "
@@ -219,16 +220,31 @@ def visual_score(model, screenshot_b64: str, refs: list[str]) -> tuple[float, st
         "{\"visual_score\": <float>, \"confirmed\": [<signals>], \"rejected\": <bool>, \"note\": \"<one sentence>\"}\n\n"
         "Reference photo 1 (full side view):"
     )
-    try:
-        response = model.generate_content(
-            [prompt, _img(refs[0]), "Reference photo 2 (close-up top tube — most diagnostic):", _img(refs[1]),
-             "Listing photo to evaluate:", _img(screenshot_b64)],
-            generation_config={"response_mime_type": "application/json", "max_output_tokens": 256},
-        )
-        result = json.loads(response.text)
-        return float(result.get("visual_score", 0)), result.get("note", "")
-    except Exception as e:
-        return 0.0, f"parse error: {e}"
+    for attempt in range(2):
+        try:
+            response = client.models.generate_content(
+                model="gemini-1.5-flash",
+                contents=[
+                    prompt,
+                    _img_part(refs[0]),
+                    "Reference photo 2 (close-up top tube — most diagnostic):",
+                    _img_part(refs[1]),
+                    "Listing photo to evaluate:",
+                    _img_part(screenshot_b64),
+                ],
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    max_output_tokens=256,
+                ),
+            )
+            result = json.loads(response.text)
+            return float(result.get("visual_score", 0)), result.get("note", "")
+        except Exception as e:
+            if attempt == 0 and "429" in str(e):
+                time.sleep(30)   # back off on rate limit and retry once
+                continue
+            return 0.0, f"error: {str(e)[:120]}"
+    return 0.0, "rate limit — skipped"
 
 # ── GitHub Issue ──────────────────────────────────────────────────────────────
 
@@ -278,8 +294,7 @@ def create_issue(matches: list[dict]) -> None:
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    genai.configure(api_key=GEMINI_API_KEY)
-    model    = genai.GenerativeModel("gemini-2.0-flash")
+    client   = genai.Client(api_key=GEMINI_API_KEY)
     refs_b64 = [load_b64(p) for p in REFERENCE_IMAGES]
 
     candidates: dict[str, dict] = {}  # item_id → candidate dict
@@ -382,7 +397,7 @@ def main():
                 except Exception:
                     continue
 
-            vis, note = visual_score(model, screenshot_b64, refs_b64)
+            vis, note = visual_score(client, screenshot_b64, refs_b64)
             c["visual_score"] = vis
             c["visual_note"]  = note
             c["final_score"]  = c["text_score"] + vis
