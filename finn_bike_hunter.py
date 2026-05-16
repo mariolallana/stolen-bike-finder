@@ -261,35 +261,50 @@ def already_reported(item_id: str) -> bool:
         return False
     return any(item_id in (i.get("body") or "") for i in r.json())
 
+def _stars(pct: int) -> str:
+    if pct >= 72: return "★★★★★"
+    if pct >= 56: return "★★★★☆"
+    if pct >= 39: return "★★★☆☆"
+    return "★★☆☆☆"
+
 def create_issue(matches: list[dict]) -> None:
     if not GITHUB_TOKEN:
         print("No GITHUB_TOKEN — skipping issue creation")
         return
 
-    lines = [f"## {len(matches)} potential White CX Lite match(es) on finn.no\n"]
+    # One issue per match — cleaner email subjects
     for m in matches:
-        layer = "Brand query" if m.get("brand_query") else "**Spec-only query** (no brand in listing)"
-        lines += [
-            f"### {m['title']}",
-            f"**Score:** {m['final_score']:.1f} / 18.0  (text {m['text_score']:.1f} + visual {m['visual_score']:.1f})",
-            f"**Price:** {m['price']} NOK",
-            f"**Found via:** {layer}",
-            f"**Text hits:** {' · '.join(m['hits']) if m['hits'] else 'none (spec-only)'}",
-            f"**Visual:** {m['visual_note']}",
-            f"**Item ID:** {m['item_id']}",
-            f"**Link:** {m['url']}\n",
-        ]
+        pct   = round((m["final_score"] / 18.0) * 100)
+        stars = _stars(pct)
+        title = m.get("title", "?")
+        price = m.get("price", "?")
+        hits  = " · ".join(m.get("hits", [])) or "no brand in title (spec-only match)"
+        note  = m.get("visual_note", "—")
 
-    owner, repo = GITHUB_REPO.split("/")
-    r = requests.post(
-        f"https://api.github.com/repos/{owner}/{repo}/issues",
-        headers={"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"},
-        json={"title": f"🚲 Bike match — {len(matches)} listing(s) on finn.no", "body": "\n".join(lines)},
-    )
-    if r.status_code == 201:
-        print(f"Issue created: {r.json()['html_url']}")
-    else:
-        print(f"Issue creation failed: {r.status_code} {r.text[:200]}")
+        body = f"""## {title}
+
+**{stars} {pct}% match** &nbsp;·&nbsp; text {m['text_score']:.1f} + visual {m['visual_score']:.1f}
+
+> {note}
+
+**Price:** {price} NOK
+**Signals:** {hits}
+
+## [→ Open on finn.no]({m['url']})
+"""
+
+        issue_title = f"🚲 {stars} {title} · {price} NOK"
+
+        owner, repo = GITHUB_REPO.split("/")
+        r = requests.post(
+            f"https://api.github.com/repos/{owner}/{repo}/issues",
+            headers={"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"},
+            json={"title": issue_title, "body": body},
+        )
+        if r.status_code == 201:
+            print(f"Issue created: {r.json()['html_url']}")
+        else:
+            print(f"Issue creation failed: {r.status_code} {r.text[:200]}")
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
