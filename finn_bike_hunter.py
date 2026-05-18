@@ -265,7 +265,9 @@ def visual_score(client, img_b64: str, refs: list[str]) -> tuple[float, str]:
                 contents=contents,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
-                    max_output_tokens=512,
+                    max_output_tokens=8192,
+                    # Disable thinking — wastes tokens against the output budget
+                    thinking_config=types.ThinkingConfig(thinking_budget=0),
                 ),
             )
             text = response.text.strip()
