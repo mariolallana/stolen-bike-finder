@@ -131,7 +131,7 @@ def build_search_url(query: str) -> str:
         f"https://www.finn.no/recommerce/forsale/search"
         f"?q={query}&location={LOCATION_CODE}&radius={RADIUS_KM}"
     )
-    if MAX_PRICE:
+    if MAX_PRICE is not None:
         url += f"&price_to={MAX_PRICE}"
     return url
 
@@ -259,33 +259,44 @@ def visual_score(client, img_b64: str, refs: list[str]) -> tuple[float, str]:
         _part(img_b64),
     ])
     for model_name in GEMINI_MODELS:
+        # ThinkingConfig is only valid on gemini-2.5-* — sending it to older models
+        # causes a 400 INVALID_ARGUMENT that would abort the fallback chain
+        config_kwargs: dict = {
+            "response_mime_type": "application/json",
+            "max_output_tokens": 8192,
+        }
+        if "2.5" in model_name:
+            config_kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
+
+        response = None
         try:
             response = client.models.generate_content(
                 model=model_name,
                 contents=contents,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    max_output_tokens=8192,
-                    # Disable thinking — wastes tokens against the output budget
-                    thinking_config=types.ThinkingConfig(thinking_budget=0),
-                ),
+                config=types.GenerateContentConfig(**config_kwargs),
             )
             text = response.text.strip()
-            # Some models wrap JSON in markdown fences despite response_mime_type setting
             text = re.sub(r'^```[^\n]*\n', '', text)
             text = re.sub(r'\n?```$', '', text.strip())
             result = json.loads(text)
-            print(f"  [{model_name}] ok")
+            print(f"  [{model_name}] ok → {result.get('visual_score', '?')}")
             return float(result.get("visual_score", 0)), result.get("note", "")
         except Exception as e:
             err = str(e)
+            # Quota / rate limit → try next model
             if "429" in err or "quota" in err.lower():
-                # Daily/project quota exhausted on this model — try next immediately
-                print(f"  [{model_name}] quota/rate error — trying next model")
-                continue
-            if "not found" in err.lower() or "404" in err:
-                print(f"  [{model_name}] not found — trying next model")
-                continue
+                print(f"  [{model_name}] quota — next model"); continue
+            # Model not found or config not supported (400/404) → try next model
+            if any(s in err for s in ("404", "400")) or any(
+                s in err.lower() for s in ("not found", "invalid", "unsupported", "unknown field")
+            ):
+                print(f"  [{model_name}] unsupported — next model"); continue
+            # Malformed JSON response → try next model (transient, not permanent)
+            if any(s in err.lower() for s in ("expecting", "unterminated", "json decode", "json")):
+                raw = getattr(response, "text", "")[:120]
+                print(f"  [{model_name}] bad JSON ({err[:60]}) raw={raw!r} — next model"); continue
+            # Unexpected error — log and stop (likely a programming mistake, not transient)
+            print(f"  [{model_name}] fatal: {err[:200]}")
             return 0.0, f"error: {err[:150]}"
     return 0.0, "all models exhausted — visual skipped"
 
@@ -295,7 +306,11 @@ def get_reported_ids() -> set[str]:
     """One API call — returns all item IDs already in issues (open or closed)."""
     if not GITHUB_TOKEN:
         return set()
-    owner, repo = GITHUB_REPO.split("/")
+    parts = GITHUB_REPO.split("/")
+    if len(parts) != 2:
+        print(f"WARNING: GITHUB_REPOSITORY malformed ({GITHUB_REPO!r}) — dedup disabled")
+        return set()
+    owner, repo = parts
     r = requests.get(
         f"https://api.github.com/repos/{owner}/{repo}/issues",
         headers={"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"},
@@ -342,7 +357,7 @@ def create_issue(matches: list[dict]) -> None:
 
         issue_title = f"🚲 {stars} {title} · {price} NOK"
 
-        owner, repo = GITHUB_REPO.split("/")
+        owner, repo = GITHUB_REPO.split("/", 1)
         r = requests.post(
             f"https://api.github.com/repos/{owner}/{repo}/issues",
             headers={"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"},
@@ -356,6 +371,10 @@ def create_issue(matches: list[dict]) -> None:
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
+    for p in REFERENCE_IMAGES:
+        if not os.path.exists(p):
+            raise FileNotFoundError(f"Reference image missing: {p}\nCommit the images/ directory to the repo.")
+
     client   = genai.Client(api_key=GEMINI_API_KEY)
     refs_b64 = [load_b64(p) for p in REFERENCE_IMAGES]
 
