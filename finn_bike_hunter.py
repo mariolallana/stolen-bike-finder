@@ -27,9 +27,11 @@ from playwright.sync_api import sync_playwright
 
 GEMINI_API_KEY  = os.environ["GEMINI_API_KEY"]
 GEMINI_MODELS   = [          # tried in order until one works
-    "gemini-1.5-flash-latest",
-    "gemini-1.5-flash-002",
+    "gemini-2.5-flash",          # newest — fresh quota pool
+    "gemini-2.5-flash-preview-05-20",
     "gemini-2.0-flash-lite",
+    "gemini-1.5-flash-latest",
+    "gemini-1.5-flash-8b",
 ]
 GITHUB_TOKEN      = os.environ.get("GITHUB_TOKEN", "")
 GITHUB_REPO       = os.environ.get("GITHUB_REPOSITORY", "mariolallana/stolen-bike-finder")
@@ -257,27 +259,29 @@ def visual_score(client, img_b64: str, refs: list[str]) -> tuple[float, str]:
         _part(img_b64),
     ])
     for model_name in GEMINI_MODELS:
-        for attempt in range(2):
-            try:
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=contents,
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        max_output_tokens=512,
-                    ),
-                )
-                result = json.loads(response.text)
-                return float(result.get("visual_score", 0)), result.get("note", "")
-            except Exception as e:
-                err = str(e)
-                if "not found" in err.lower() or "404" in err:
-                    break          # try next model name
-                if attempt == 0 and "429" in err:
-                    print(f"  Rate limited on {model_name} — waiting 30s")
-                    time.sleep(30); continue
-                return 0.0, f"error: {err[:150]}"
-    return 0.0, "all models failed"
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    max_output_tokens=512,
+                ),
+            )
+            result = json.loads(response.text)
+            print(f"  [{model_name}] ok")
+            return float(result.get("visual_score", 0)), result.get("note", "")
+        except Exception as e:
+            err = str(e)
+            if "429" in err or "quota" in err.lower():
+                # Daily/project quota exhausted on this model — try next immediately
+                print(f"  [{model_name}] quota/rate error — trying next model")
+                continue
+            if "not found" in err.lower() or "404" in err:
+                print(f"  [{model_name}] not found — trying next model")
+                continue
+            return 0.0, f"error: {err[:150]}"
+    return 0.0, "all models exhausted — visual skipped"
 
 # ── GitHub Issue ──────────────────────────────────────────────────────────────
 
