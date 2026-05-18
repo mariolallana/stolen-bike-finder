@@ -268,7 +268,11 @@ def visual_score(client, img_b64: str, refs: list[str]) -> tuple[float, str]:
                     max_output_tokens=512,
                 ),
             )
-            result = json.loads(response.text)
+            text = response.text.strip()
+            # Some models wrap JSON in markdown fences despite response_mime_type setting
+            text = re.sub(r'^```[^\n]*\n', '', text)
+            text = re.sub(r'\n?```$', '', text.strip())
+            result = json.loads(text)
             print(f"  [{model_name}] ok")
             return float(result.get("visual_score", 0)), result.get("note", "")
         except Exception as e:

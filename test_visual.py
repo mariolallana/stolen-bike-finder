@@ -12,7 +12,7 @@ Three test cases:
   3. SIDE  — bike_image_1.jpeg as listing photo  → expect high score (≥ 4.0)
 """
 
-import os, sys, base64, json, io
+import os, sys, base64, json, io, re
 from pathlib import Path
 
 # Resolve paths relative to this file so test can be run from any directory
@@ -79,13 +79,21 @@ def visual_score(client, img_b64: str, refs: list[str]) -> tuple[float, str, str
                     max_output_tokens=512,
                 ),
             )
-            result = json.loads(response.text)
+            text = response.text.strip()
+            text = re.sub(r'^```[^\n]*\n', '', text)
+            text = re.sub(r'\n?```$', '', text.strip())
+            result = json.loads(text)
             return float(result.get("visual_score", 0)), result.get("note", ""), model_name
         except Exception as e:
             err = str(e)
             if "429" in err or "quota" in err.lower() or "not found" in err.lower() or "404" in err:
                 print(f"    [{model_name}] skip: {err[:80]}")
                 continue
+            # JSON parse error — print raw response for debugging
+            if "Expecting" in err or "json" in err.lower():
+                raw = getattr(locals().get("response", None), "text", "no response")
+                print(f"    [{model_name}] JSON error: {err[:80]}")
+                print(f"    Raw response: {str(raw)[:200]}")
             return 0.0, f"error: {err[:120]}", model_name
     return 0.0, "all models exhausted", "—"
 
