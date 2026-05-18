@@ -279,8 +279,13 @@ def visual_score(client, img_b64: str, refs: list[str]) -> tuple[float, str]:
             text = re.sub(r'^```[^\n]*\n', '', text)
             text = re.sub(r'\n?```$', '', text.strip())
             result = json.loads(text)
-            print(f"  [{model_name}] ok → {result.get('visual_score', '?')}")
-            return float(result.get("visual_score", 0)), result.get("note", "")
+            score = float(result.get("visual_score", 0))
+            note  = result.get("note", "")
+            # Hard veto: explicit rejection overrides any residual numeric score
+            if result.get("rejected") is True:
+                score = -999.0
+            print(f"  [{model_name}] ok → {score}")
+            return score, note
         except Exception as e:
             err = str(e)
             # Quota / rate limit → try next model
@@ -477,12 +482,14 @@ def main():
 
             shots += 1
             vis, note = visual_score(client, img_b64, refs_b64)
-            c["visual_score"] = vis
+            rejected = vis <= -999.0
+            c["visual_score"] = 0.0 if rejected else vis
             c["visual_note"]  = note
-            c["final_score"]  = c["text_score"] + vis
-            print(f"  Visual +{vis:.1f}: {note}")
+            c["final_score"]  = 0.0 if rejected else (c["text_score"] + vis)
+            label = "REJECTED" if rejected else f"+{vis:.1f}"
+            print(f"  Visual {label}: {note}")
 
-            if c["final_score"] >= 5.0:
+            if not rejected and c["final_score"] >= 5.0:
                 matches.append(c)
 
         browser.close()
